@@ -1,80 +1,57 @@
-"""Job runner module — executes shell commands and integrates logging + alerting."""
+"""Job runner with integrated retry support."""
 
 import subprocess
-import time
 from typing import Optional
 
-from cronwrap.logger import CronLogger
 from cronwrap.alerting import Alerter, AlertConfig
+from cronwrap.logger import CronLogger
+from cronwrap.retry import RetryConfig, RetryHandler
 
 
 class JobRunner:
-    """Runs a cron job command with logging and optional alerting."""
+    """Runs a shell command as a cron job with logging, alerting, and retries."""
 
     def __init__(
         self,
         job_name: str,
-        command: str,
-        logger: Optional[CronLogger] = None,
         alerter: Optional[Alerter] = None,
-        timeout: Optional[float] = None,
-    ):
+        retry_config: Optional[RetryConfig] = None,
+    ) -> None:
         self.job_name = job_name
-        self.command = command
-        self.logger = logger or CronLogger(job_name)
         self.alerter = alerter
-        self.timeout = timeout
+        self.logger = CronLogger(job_name)
+        self.retry_handler = RetryHandler(retry_config or RetryConfig(max_attempts=1, delay_seconds=0))
 
-    def run(self) -> int:
-        """Execute the command and return its exit code."""
-        log = self.logger
-        log.log_start()
-        log.info(f"Running command: {self.command}")
-
-        start = time.monotonic()
-        exit_code = 0
-        stderr_output = ""
-
+    def run(self, command: str) -> int:
+        """Execute *command* in a shell.  Returns the exit code."""
+        self.logger.log_start()
         try:
-            result = subprocess.run(
-                self.command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-            exit_code = result.returncode
-            stderr_output = result.stderr
-
-            if result.stdout:
-                log.info(f"stdout: {result.stdout.rstrip()}")
-            if result.stderr:
-                log.warning(f"stderr: {result.stderr.rstrip()}")
-
-        except subprocess.TimeoutExpired as exc:
-            exit_code = -1
-            stderr_output = f"Timed out after {self.timeout}s"
-            log.error(stderr_output)
-
-        duration = time.monotonic() - start
-        log.log_end(exit_code=exit_code)
-
-        if exit_code != 0 and self.alerter:
-            self.alerter.alert_failure(self.job_name, exit_code, stderr_output)
-
-        if self.alerter and self.alerter.should_alert_duration(duration):
-            self.alerter.alert_duration(self.job_name, duration)
-
+            exit_code = self.retry_handler.run(self.run_job, command)
+        except Exception as exc:
+            self.logger.error("Job failed after all retry attempts: %s", exc)
+            exit_code = 1
+            if self.alerter:
+                self.alerter.alert_failure(
+                    self.job_name,
+                    error_message=str(exc),
+                )
+        finally:
+            self.logger.log_end()
         return exit_code
 
+    def run_job(self, command: str) -> int:
+        """Run *command* once and return the exit code.
 
-def run_job(
-    job_name: str,
-    command: str,
-    alert_config: Optional[AlertConfig] = None,
-    timeout: Optional[float] = None,
-) -> int:
-    """Convenience function to run a job with optional alert configuration."""
-    alerter = Alerter(alert_config) if alert_config else None
-    runner = JobRunner(job_name, command, alerter=alerter, timeout=timeout)
-    return runner.run()
+        Raises :class:`RuntimeError` on non-zero exit so the retry handler
+        can detect failure.
+        """
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        if result.stdout:
+            self.logger.info(result.stdout.rstrip())
+        if result.stderr:
+            self.logger.error(result.stderr.rstrip())
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Command exited with code {result.returncode}: {command}"
+            )
+        return result.returncode
