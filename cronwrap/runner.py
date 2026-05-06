@@ -1,57 +1,54 @@
-"""Job runner with integrated retry support."""
+"""Job runner with optional retry, alerting, and timeout support."""
+from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass, field
 from typing import Optional
 
-from cronwrap.alerting import Alerter, AlertConfig
-from cronwrap.logger import CronLogger
+from cronwrap.alerting import Alerter
+from cronwrap.metrics import JobMetrics
 from cronwrap.retry import RetryConfig, RetryHandler
+from cronwrap.timeout import TimeoutConfig, TimeoutExpired, TimeoutHandler
 
 
+@dataclass
 class JobRunner:
-    """Runs a shell command as a cron job with logging, alerting, and retries."""
+    command: str
+    alerter: Optional[Alerter] = None
+    retry_config: RetryConfig = field(default_factory=RetryConfig)
+    timeout_config: TimeoutConfig = field(default_factory=TimeoutConfig)
+    metrics: JobMetrics = field(default_factory=JobMetrics)
 
-    def __init__(
-        self,
-        job_name: str,
-        alerter: Optional[Alerter] = None,
-        retry_config: Optional[RetryConfig] = None,
-    ) -> None:
-        self.job_name = job_name
-        self.alerter = alerter
-        self.logger = CronLogger(job_name)
-        self.retry_handler = RetryHandler(retry_config or RetryConfig(max_attempts=1, delay_seconds=0))
+    def run(self) -> int:
+        """Execute the job, applying retry and timeout logic."""
+        retry_handler = RetryHandler(self.retry_config)
+        timeout_handler = TimeoutHandler(self.timeout_config)
 
-    def run(self, command: str) -> int:
-        """Execute *command* in a shell.  Returns the exit code."""
-        self.logger.log_start()
+        self.metrics.log_start()
         try:
-            exit_code = self.retry_handler.run(self.run_job, command)
-        except Exception as exc:
-            self.logger.error("Job failed after all retry attempts: %s", exc)
-            exit_code = 1
+            exit_code = retry_handler.run(
+                lambda: timeout_handler.run(self.run_job)
+            )
+        except TimeoutExpired as exc:
+            exit_code = 124  # same convention as the `timeout` shell command
             if self.alerter:
                 self.alerter.alert_failure(
-                    self.job_name,
-                    error_message=str(exc),
+                    self.command,
+                    self.metrics,
+                    reason=str(exc),
                 )
         finally:
-            self.logger.log_end()
+            self.metrics.log_end(exit_code if 'exit_code' in dir() else 1)  # type: ignore[possibly-undefined]
+
+        if exit_code != 0 and self.alerter:
+            self.alerter.alert_failure(self.command, self.metrics)
+
         return exit_code
 
-    def run_job(self, command: str) -> int:
-        """Run *command* once and return the exit code.
-
-        Raises :class:`RuntimeError` on non-zero exit so the retry handler
-        can detect failure.
-        """
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        if result.stdout:
-            self.logger.info(result.stdout.rstrip())
-        if result.stderr:
-            self.logger.error(result.stderr.rstrip())
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Command exited with code {result.returncode}: {command}"
-            )
+    def run_job(self) -> int:
+        """Spawn the command in a subprocess and return its exit code."""
+        result = subprocess.run(  # noqa: S603
+            self.command,
+            shell=True,  # noqa: S602
+        )
         return result.returncode

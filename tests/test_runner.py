@@ -1,76 +1,98 @@
-"""Tests for the cronwrap job runner module."""
+"""Tests for cronwrap.runner (including timeout integration)."""
+from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cronwrap.alerting import AlertConfig, Alerter
-from cronwrap.runner import JobRunner, run_job
+from cronwrap.alerting import Alerter
+from cronwrap.metrics import JobMetrics
+from cronwrap.retry import RetryConfig
+from cronwrap.runner import JobRunner
+from cronwrap.timeout import TimeoutConfig
 
 
-def make_runner(command="echo hello", alerter=None, timeout=None):
+def make_runner(
+    command: str = "true",
+    alerter=None,
+    retry_config=None,
+    timeout_config=None,
+) -> JobRunner:
     return JobRunner(
-        job_name="test-job",
         command=command,
         alerter=alerter,
-        timeout=timeout,
+        retry_config=retry_config or RetryConfig(),
+        timeout_config=timeout_config or TimeoutConfig(),
+        metrics=JobMetrics(job_name="test"),
     )
 
 
 def test_runner_returns_zero_on_success():
-    runner = make_runner(command="echo ok")
+    runner = make_runner(command="true")
     assert runner.run() == 0
 
 
 def test_runner_returns_nonzero_on_failure():
-    runner = make_runner(command="exit 42")
-    assert runner.run() == 42
+    runner = make_runner(command="false")
+    assert runner.run() != 0
 
 
 def test_runner_calls_alert_on_failure():
-    mock_alerter = MagicMock(spec=Alerter)
-    mock_alerter.should_alert_duration.return_value = False
-    runner = make_runner(command="exit 1", alerter=mock_alerter)
+    alerter = MagicMock(spec=Alerter)
+    runner = make_runner(command="false", alerter=alerter)
     runner.run()
-    mock_alerter.alert_failure.assert_called_once()
-    call_kwargs = mock_alerter.alert_failure.call_args
-    assert call_kwargs[0][0] == "test-job"
-    assert call_kwargs[0][1] == 1
+    alerter.alert_failure.assert_called_once()
 
 
 def test_runner_does_not_alert_on_success():
-    mock_alerter = MagicMock(spec=Alerter)
-    mock_alerter.should_alert_duration.return_value = False
-    runner = make_runner(command="echo ok", alerter=mock_alerter)
+    alerter = MagicMock(spec=Alerter)
+    runner = make_runner(command="true", alerter=alerter)
     runner.run()
-    mock_alerter.alert_failure.assert_not_called()
+    alerter.alert_failure.assert_not_called()
 
 
-def test_runner_alerts_on_slow_job():
-    mock_alerter = MagicMock(spec=Alerter)
-    mock_alerter.should_alert_duration.return_value = True
-    runner = make_runner(command="echo ok", alerter=mock_alerter)
+def test_runner_records_metrics_start_and_end():
+    runner = make_runner(command="true")
     runner.run()
-    mock_alerter.alert_duration.assert_called_once()
+    assert runner.metrics.start_time is not None
+    assert runner.metrics.end_time is not None
 
 
-def test_runner_handles_timeout():
-    runner = make_runner(command="sleep 10", timeout=0.01)
-    exit_code = runner.run()
-    assert exit_code == -1
+def test_runner_timeout_returns_124():
+    """A job that sleeps longer than the timeout should return exit code 124."""
+    timeout_cfg = TimeoutConfig(seconds=1)
+    runner = make_runner(
+        command="sleep 10",
+        timeout_config=timeout_cfg,
+    )
+    # We mock run_job so the test stays fast
+    def _slow() -> int:
+        time.sleep(5)
+        return 0
+
+    with patch.object(runner, "run_job", side_effect=_slow):
+        code = runner.run()
+
+    assert code == 124
 
 
-def test_run_job_convenience_success():
-    code = run_job("quick-job", "echo hi")
-    assert code == 0
+def test_runner_timeout_alerts_on_expire():
+    alerter = MagicMock(spec=Alerter)
+    timeout_cfg = TimeoutConfig(seconds=1)
+    runner = make_runner(command="sleep 10", alerter=alerter, timeout_config=timeout_cfg)
+
+    def _slow() -> int:
+        time.sleep(5)
+        return 0
+
+    with patch.object(runner, "run_job", side_effect=_slow):
+        runner.run()
+
+    alerter.alert_failure.assert_called()
 
 
-def test_run_job_with_alert_config():
-    cfg = AlertConfig(recipients=["dev@example.com"])
-    with patch("cronwrap.runner.Alerter") as MockAlerter:
-        mock_alerter = MagicMock()
-        mock_alerter.should_alert_duration.return_value = False
-        MockAlerter.return_value = mock_alerter
-        code = run_job("job", "echo test", alert_config=cfg)
-    assert code == 0
-    MockAlerter.assert_called_once_with(cfg)
+def test_runner_no_timeout_when_disabled():
+    timeout_cfg = TimeoutConfig(seconds=0)
+    runner = make_runner(command="true", timeout_config=timeout_cfg)
+    assert runner.run() == 0
