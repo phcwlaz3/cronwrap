@@ -1,4 +1,4 @@
-"""Job runner with optional retry, alerting, and timeout support."""
+"""JobRunner — executes a cron command with optional alerting, retry, and rate limiting."""
 from __future__ import annotations
 
 import subprocess
@@ -7,48 +7,59 @@ from typing import Optional
 
 from cronwrap.alerting import Alerter
 from cronwrap.metrics import JobMetrics
-from cronwrap.retry import RetryConfig, RetryHandler
-from cronwrap.timeout import TimeoutConfig, TimeoutExpired, TimeoutHandler
+from cronwrap.ratelimit import RateLimiter, RateLimitConfig
 
 
 @dataclass
 class JobRunner:
     command: str
+    job_name: str = "unnamed"
     alerter: Optional[Alerter] = None
-    retry_config: RetryConfig = field(default_factory=RetryConfig)
-    timeout_config: TimeoutConfig = field(default_factory=TimeoutConfig)
-    metrics: JobMetrics = field(default_factory=JobMetrics)
+    rate_limiter: Optional[RateLimiter] = None
+    timeout: Optional[int] = None  # seconds; None means no timeout
 
     def run(self) -> int:
-        """Execute the job, applying retry and timeout logic."""
-        retry_handler = RetryHandler(self.retry_config)
-        timeout_handler = TimeoutHandler(self.timeout_config)
-
-        self.metrics.log_start()
-        try:
-            exit_code = retry_handler.run(
-                lambda: timeout_handler.run(self.run_job)
-            )
-        except TimeoutExpired as exc:
-            exit_code = 124  # same convention as the `timeout` shell command
-            if self.alerter:
-                self.alerter.alert_failure(
-                    self.command,
-                    self.metrics,
-                    reason=str(exc),
+        """Run the job, respecting rate limits.  Returns the exit code."""
+        if self.rate_limiter is not None:
+            if not self.rate_limiter.is_allowed(self.job_name):
+                remaining = self.rate_limiter.seconds_until_allowed(self.job_name)
+                print(
+                    f"[cronwrap] Job '{self.job_name}' skipped — "
+                    f"rate limited for another {remaining:.0f}s."
                 )
-        finally:
-            self.metrics.log_end(exit_code if 'exit_code' in dir() else 1)  # type: ignore[possibly-undefined]
+                return 0
 
-        if exit_code != 0 and self.alerter:
-            self.alerter.alert_failure(self.command, self.metrics)
+        metrics = JobMetrics(job_name=self.job_name, command=self.command)
+        metrics.log_start()
+
+        exit_code = self._execute(metrics)
+
+        metrics.log_end(exit_code)
+
+        if self.rate_limiter is not None:
+            self.rate_limiter.record_run(self.job_name)
+
+        if exit_code != 0 and self.alerter is not None:
+            self.alerter.alert_failure(metrics)
 
         return exit_code
 
-    def run_job(self) -> int:
-        """Spawn the command in a subprocess and return its exit code."""
-        result = subprocess.run(  # noqa: S603
-            self.command,
-            shell=True,  # noqa: S602
-        )
-        return result.returncode
+    def _execute(self, metrics: JobMetrics) -> int:
+        try:
+            result = subprocess.run(
+                self.command,
+                shell=True,
+                timeout=self.timeout,
+            )
+            return result.returncode
+        except subprocess.TimeoutExpired:
+            print(f"[cronwrap] Job '{self.job_name}' timed out after {self.timeout}s.")
+            return 124
+        except Exception as exc:  # noqa: BLE001
+            print(f"[cronwrap] Job '{self.job_name}' raised an unexpected error: {exc}")
+            return 1
+
+
+def run_job(command: str, **kwargs) -> int:  # pragma: no cover
+    """Convenience wrapper — create a runner and execute immediately."""
+    return JobRunner(command=command, **kwargs).run()
