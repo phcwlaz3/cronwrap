@@ -6,6 +6,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dataclasses import dataclass, field
 from typing import List, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,12 +41,18 @@ class Alerter:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
-        with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port) as server:
-            if self.config.use_tls:
-                server.starttls()
-            if self.config.smtp_user and self.config.smtp_password:
-                server.login(self.config.smtp_user, self.config.smtp_password)
-            server.sendmail(self.config.sender, self.config.recipients, msg.as_string())
+        try:
+            with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port) as server:
+                if self.config.use_tls:
+                    server.starttls()
+                if self.config.smtp_user and self.config.smtp_password:
+                    server.login(self.config.smtp_user, self.config.smtp_password)
+                server.sendmail(self.config.sender, self.config.recipients, msg.as_string())
+        except smtplib.SMTPException as exc:
+            logger.error("Failed to send alert email '%s': %s", subject, exc)
+        except OSError as exc:
+            logger.error("Could not connect to SMTP server %s:%d — %s",
+                         self.config.smtp_host, self.config.smtp_port, exc)
 
     def alert_failure(self, job_name: str, exit_code: int, stderr: str = "") -> None:
         """Send an alert when a job fails."""
