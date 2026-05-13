@@ -58,7 +58,44 @@ class RetryHandler:
                     exc,
                 )
                 if attempt < config.max_attempts:
-                    logger.debug("Retrying in %.1f seconds…", delay)
+                    logger.debug("Retrying in %.1f seconds\u2026", delay)
+                    time.sleep(delay)
+                    delay *= config.backoff_factor
+
+        raise last_exc  # type: ignore[misc]
+
+    def run_with_summary(self, func: Callable, *args, **kwargs):
+        """Run *func* with retries and return a summary dict.
+
+        The returned dict contains:
+          - ``result``: the function's return value on success.
+          - ``attempts``: the number of attempts made.
+          - ``succeeded``: whether the call ultimately succeeded.
+
+        Raises the last exception if all attempts are exhausted.
+        """
+        config = self.config
+        delay = config.delay_seconds
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, config.max_attempts + 1):
+            try:
+                result = func(*args, **kwargs)
+                if attempt > 1:
+                    logger.info(
+                        "Attempt %d/%d succeeded.", attempt, config.max_attempts
+                    )
+                return {"result": result, "attempts": attempt, "succeeded": True}
+            except config.exceptions as exc:  # type: ignore[misc]
+                last_exc = exc
+                logger.warning(
+                    "Attempt %d/%d failed: %s",
+                    attempt,
+                    config.max_attempts,
+                    exc,
+                )
+                if attempt < config.max_attempts:
+                    logger.debug("Retrying in %.1f seconds\u2026", delay)
                     time.sleep(delay)
                     delay *= config.backoff_factor
 
