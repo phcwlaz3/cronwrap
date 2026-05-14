@@ -21,6 +21,12 @@ def test_hook_config_invalid_timeout():
         HookConfig(timeout=0)
 
 
+def test_hook_config_negative_timeout():
+    """Negative timeout values should also raise ValueError."""
+    with pytest.raises(ValueError, match="timeout"):
+        HookConfig(timeout=-5)
+
+
 # ---------------------------------------------------------------------------
 # HookResult
 # ---------------------------------------------------------------------------
@@ -96,3 +102,10 @@ def test_empty_hooks_returns_empty_list():
     runner = HookRunner(cfg)
     assert runner.run_pre_hooks() == []
     assert runner.run_post_hooks() == []
+
+
+def test_hook_result_command_stored():
+    """HookResult should preserve the original command string."""
+    cmd = "echo hello"
+    r = HookResult(command=cmd, exit_code=0, stdout="hello\n", stderr="")
+    assert r.command == cmd
